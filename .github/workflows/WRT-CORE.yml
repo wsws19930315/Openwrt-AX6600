@@ -66,6 +66,10 @@ jobs:
   core:
     name: ${{inputs.WRT_SOURCE}}
     runs-on: ubuntu-latest
+    outputs:
+      cache_prefix: ${{steps.initialize-cache.outputs.cache_prefix}}
+      cache_key: ${{steps.initialize-cache.outputs.cache_key}}
+      cache_started: ${{steps.initialize-cache.outputs.cache_started}}
     steps:
       - name: Checkout Projects
         uses: actions/checkout@v4
@@ -133,21 +137,46 @@ jobs:
         run: |
           find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
 
-      - name: Check Caches
+      # Cache lifecycle adapted from VIKINGYFY/OpenWRT-CI (MIT, Copyright 2026 VIKINGYFY).
+      - name: Initialize Cache Values
+        id: initialize-cache
+        if: env.WRT_TEST != 'true'
+        run: |
+          WRT_SUBTARGET=$(grep -m 1 -oP "^CONFIG_TARGET_${WRT_TARGET}_\K[\w]+(?=\=y)" "./Config/$WRT_CONFIG.txt")
+          WRT_CACHE_SOURCE=${WRT_SOURCE//\//-}
+          WRT_CACHE_BRANCH=${WRT_BRANCH//\//-}
+          # 保留配置名隔离；PURE/PLUS 不加入键，继续共用缓存。
+          WRT_CACHE_PREFIX="wrt-$WRT_CACHE_SOURCE-$WRT_CACHE_BRANCH-$WRT_TARGET-$WRT_SUBTARGET-$WRT_CONFIG"
+          WRT_CACHE_KEY="$WRT_CACHE_PREFIX-$(git -C ./wrt rev-parse HEAD)"
+          WRT_CACHE_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "WRT_CACHE_PREFIX=$WRT_CACHE_PREFIX"
+            echo "WRT_CACHE_KEY=$WRT_CACHE_KEY"
+          } >> "$GITHUB_ENV"
+          {
+            echo "cache_prefix=$WRT_CACHE_PREFIX"
+            echo "cache_key=$WRT_CACHE_KEY"
+            echo "cache_started=$WRT_CACHE_STARTED"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore Build Cache
         id: check-cache
         if: env.WRT_TEST != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           # 缓存内容（ccache/宿主工具/工具链）与 profile 无关，PURE 和 PLUS 共享同一份，避免缓存翻倍挤占配额
-          key: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
-          restore-keys: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}
+          key: ${{env.WRT_CACHE_KEY}}
+          # 迁移时仅回退到同一源码提交的旧键，避免旧前缀混用其他分支。
+          restore-keys: |
+            ${{env.WRT_CACHE_PREFIX}}-
+            ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
           path: |
             ./wrt/.ccache
             ./wrt/staging_dir/host*
             ./wrt/staging_dir/tool*
 
-      - name: Update Caches
-        if: env.WRT_TEST != 'true'
+      - name: Prepare Restored Build Cache
+        if: env.WRT_TEST != 'true' && steps.check-cache.outputs.cache-matched-key != ''
         run: |
           if [ -d "./wrt/staging_dir" ]; then
             find "./wrt/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r DIR; do
@@ -159,16 +188,6 @@ jobs:
             echo "toolchain skipped done!"
           else
             echo "caches missed!"
-          fi
-
-          if ${{steps.check-cache.outputs.cache-hit != 'true'}}; then
-            CACHE_LIST=$(gh cache list --key "$WRT_CONFIG-$WRT_INFO" | cut -f 1)
-            for CACHE_KEY in $CACHE_LIST; do
-              # PURE/PLUS 两个任务可能并发清理同一批缓存，删除失败（已被对方删掉）不视为错误
-              gh cache delete $CACHE_KEY || true
-            done
-
-            echo "caches cleanup done!"
           fi
 
       - name: Update Feeds
@@ -227,6 +246,16 @@ jobs:
           cd ./wrt/
 
           make -j$(nproc) || make -j1 V=s
+
+      - name: Save Build Cache
+        if: env.WRT_TEST != 'true' && success() && steps.check-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{env.WRT_CACHE_KEY}}
+          path: |
+            ./wrt/.ccache
+            ./wrt/staging_dir/host*
+            ./wrt/staging_dir/tool*
 
       - name: Machine Information
         run: |
@@ -359,3 +388,39 @@ jobs:
 
             内核版本：
             ${{ env.WRT_KVER }}
+
+  cache-rollover:
+    name: Roll cache generations
+    needs: core
+    if: inputs.WRT_TEST != 'true' && needs.core.result == 'success'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: wrt-cache-rollover-${{github.ref}}-${{needs.core.outputs.cache_prefix}}
+      cancel-in-progress: false
+    env:
+      GH_REPO: ${{github.repository}}
+      WRT_CACHE_PREFIX: ${{needs.core.outputs.cache_prefix}}
+      WRT_CACHE_KEY: ${{needs.core.outputs.cache_key}}
+      WRT_CACHE_STARTED: ${{needs.core.outputs.cache_started}}
+    steps:
+      - name: Roll Build Cache
+        # 清理异常只警告，不把已发布固件标为构建失败。
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          CACHES=$(gh cache list --repo "$GH_REPO" --key "$WRT_CACHE_PREFIX-" --ref "$GITHUB_REF" --limit 100 --json id,key,createdAt)
+          CURRENT_CREATED=$(jq -r --arg key "$WRT_CACHE_KEY" '[.[] | select(.key == $key) | .createdAt] | min // empty' <<< "$CACHES")
+          if [ -z "$CURRENT_CREATED" ]; then
+            echo "skip cache rollover: current cache is not available"
+            exit 0
+          fi
+
+          # 只清理早于本次恢复、且早于当前缓存的条目。
+          # 保护重叠构建新保存的缓存，也防止重跑旧提交删除较新的缓存。
+          jq -r --arg key "$WRT_CACHE_KEY" --arg started "$WRT_CACHE_STARTED" --arg current "$CURRENT_CREATED" \
+            '.[] | select(.key != $key and .createdAt < $started and .createdAt < $current) | .id' <<< "$CACHES" |
+            while IFS= read -r CACHE_ID; do
+              [ -n "$CACHE_ID" ] || continue
+              gh cache delete "$CACHE_ID" --repo "$GH_REPO" ||
+                echo "::warning::Failed to delete cache $CACHE_ID"
+            done
